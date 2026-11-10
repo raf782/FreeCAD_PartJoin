@@ -1,0 +1,1104 @@
+# -*- coding: utf-8 -*-
+# ============================================================================
+#  MacroDecoupeJoint.FCMacro
+#  Découpe un solide FreeCAD selon un plan et ajoute un joint d'assemblage
+#  aux deux parties obtenues (pour pièces imprimées en 3D : fuselages,
+#  ailes et pièces d'avion RC).
+#
+#  Version cible   : FreeCAD 0.20 / 0.21 / 1.0  (Python 3.8+)
+#  Modules utilisés: FreeCAD, Part, FreeCADGui, PySide (fournis avec FreeCAD)
+#  Bibliothèques externes : aucune.
+#
+#  INSTALLATION
+#  ------------
+#  1. Copier ce fichier dans le dossier des macros de FreeCAD
+#     (menu Macros > Macros... > bouton "Dossier des macros utilisateur").
+#  2. Redémarrer FreeCAD ou utiliser Macro > Recharger.
+#  3. Lancer via menu Macros > Macros... > MacroDecoupeJoint > Exécuter.
+#
+#  UTILISATION DU PLAN DE COUPE
+#  ----------------------------
+#  Bouton "Importer depuis la sélection" accepte (dans la vue 3D OU l'arbre) :
+#    * une face plane d'un solide ;
+#    * un plan de repère (datum PartDesign::Plane ou plan d'origine App::Plane) ;
+#    * un plan primitive Part::Plane (créé dans l'atelier Part) ;
+#    * une esquisse (son plan XY local) ;
+#    * un solide (le sélectionne comme pièce à découper).
+#  La normale d'une face est orientée vers l'extérieur de la matière.
+#  Saisie manuelle possible : origine + normale X/Y/Z dans la boîte de dialogue.
+#  NB : le plan est glissé DANS son propre plan pour être centré sous la
+#  pièce — le plan de coupe reste exactement le vôtre.
+#
+#  TYPES DE JOINTS — état réel
+#  ---------------------------
+#  * "Box joint — doigts alternés" (DÉFAUT) : IMPLÉMENTÉ. Type classique de
+#    box joint : n doigts rectangulaires (tenons) sur la partie mâle, rangés
+#    côte à côte avec des espaces de même largeur, mortaises correspondantes
+#    dans la partie femelle. Les deux pièces s'emboîtent par simple
+#    enfoncement droit. Le doigt couvre toute la profondeur de section ; la
+#    largeur et la longueur sont automatiques (ou manuelles).
+#  * "Tenon et mortaise (tenon unique)" : IMPLÉMENTÉ. Un seul gros tenon
+#    prismatique centré sur la section, mortaise correspondante avec jeu.
+#  * "Emboîtement rectangulaire (bande pleine)" : IMPLÉMENTÉ. La tranche de
+#    matière située dans la bande [plan ; plan+profondeur] est transférée en
+#    totalité du côté mâle (tenon épousant la surface réelle de la pièce),
+#    et évidée du côté femelle. Une fois assemblé, cela ressemble à une
+#    découpe droite avec un décrochement : à choisir quand on veut une
+#    surface de collage maximale plutôt des doigts visibles.
+#  * "Jeu d'impression réglable" : IMPLÉMENTÉ, commun aux trois types
+#    (jeu latéral et jeu de fond = valeur saisie).
+#  * "Clé de positionnement (goupille)" : NON IMPLÉMENTÉ, prévu pour une
+#    version ultérieure (ne pas utiliser).
+#
+#  STRATÉGIE GÉOMÉTRIQUE (résumé)
+#  ------------------------------
+#  1. Validation de la forme (valide, solides fermés).
+#  2. Le plan est re-centré sous le centre de la pièce (même plan, glissé
+#     dans son propre plan) pour que les outils couvrent toujours la pièce.
+#  3. Deux demi-espaces géants découpent la pièce en A et B (vraies
+#     opérations booléennes Part.cut). Si un côté est vide -> erreur.
+#  4. La "bande de joint" = intersection de la pièce avec une dalle
+#     d'épaisseur d le long de la normale (côté femelle). Comme elle est
+#     issue de la pièce elle-même, le tenon ne déborde JAMAIS de la pièce
+#     (même pour des sections atypiques ou multi-îles).
+#  5. Emboîtement : bande + extension de 2xjeu dans la partie mâle,
+#     décalée de -jeu (offset) => tenon avec jeu latéral et jeu de fond,
+#     raccord volumique garanti avec la partie mâle. Mortaise = découpe de
+#     la bande dans la partie femelle.
+#  6. Tenons : prismes 2D posés sur le plan, intersectés avec la bande
+#     étendue (donc ancrés dans la matière), mortaises = prismes dilatés
+#     du jeu latéral et de jeu de fond.
+#
+#  LIMITES CONNUES
+#  ---------------
+#  * Parois fines : si la profondeur + jeu dépasse l'épaisseur locale de la
+#    pièce, le joint perce la surface ; un avertissement est émis.
+#  * Sections qui se rétrécissent fortement juste après le plan : le tenon
+#    peut être partiellement hors matière ; avertissement émis.
+#  * L'offset (jeu latéral) peut échouer sur des formes très complexes ou
+#    des parois < 2x jeu : dans ce cas le jeu latéral n'est PAS appliqué
+#    (ajustement serré) et c'est signalé.
+#  * Le jeu d'impression dépend de l'imprimante/matériau/orientation :
+#    0.15 à 0.30 mm est un point de départ typique en FDM, à ajuster.
+#
+#  SURCHARGE SANS INTERFACE (scripts/tests) :
+#      import MacroDecoupeJoint ; MacroDecoupeJoint.PARAMS = {...}
+#      puis exécuter MacroDecoupeJoint.executer(MacroDecoupeJoint.PARAMS)
+#      Clés : objet, origine, normale, type_joint ("bande"|"tenon"|"tenons"),
+#             dir_auto, direction, profondeur, jeu, nb_tenons, larg_tenon,
+#             long_tenon, cote_male ("A"|"B"), inverser, prefixe.
+# ============================================================================
+
+import math
+import traceback
+
+import FreeCAD as App
+import Part
+
+try:
+    import FreeCADGui as Gui
+    GUI_DISPONIBLE = True
+except Exception:
+    Gui = None
+    GUI_DISPONIBLE = False
+
+from PySide import QtCore, QtGui, QtWidgets
+
+PARAMS = None  # surcharge éventuelle hors interface graphique
+
+
+# ---------------------------------------------------------------------------
+#  Journalisation et exceptions
+# ---------------------------------------------------------------------------
+
+class ErreurDecoupe(Exception):
+    """Erreur maitrisee avec message destine a l'utilisateur."""
+
+
+def _log(msg):
+    App.Console.PrintMessage("[DecoupeJoint] " + msg + "\n")
+
+
+def _warn(msg):
+    App.Console.PrintWarning("[DecoupeJoint] AVERTISSEMENT : " + msg + "\n")
+
+
+def _op(fonction, message):
+    """Exécute une opération booléenne OCC en convertissant l'erreur."""
+    try:
+        return fonction()
+    except Exception as exc:
+        raise ErreurDecoupe(message + " (" + str(exc) + ")")
+
+
+def _ihm_disponible():
+    """Interface graphique réellement utilisable (FreeCADGui importé ET
+    QApplication existante) : freecadcmd importe FreeCADGui sans QApplication,
+    ce qui ferait planter tout QMessageBox."""
+    if not GUI_DISPONIBLE:
+        return False
+    try:
+        return QtWidgets.QApplication.instance() is not None
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+#  Outils géométriques
+# ---------------------------------------------------------------------------
+
+def _rotation_axes(u, v, n):
+    """Rotation plaçant les axes locaux X,Y,Z sur u,v,n.
+
+    La base est corrigée en base DIRECTE (u x v = n) : une base indirecte
+    donne une matrice de réflexion dont App.Rotation extrait une rotation
+    arbitraire (l'axe femelle f = -normale produisait ainsi des outils du
+    mauvais côté — bug majeur corrigé ici).
+    """
+    if u.cross(v).dot(n) < 0.0:
+        v = App.Vector(v).negative()
+    mat = App.Matrix(u.x, v.x, n.x, 0.0,
+                     u.y, v.y, n.y, 0.0,
+                     u.z, v.z, n.z, 0.0,
+                     0.0, 0.0, 0.0, 1.0)
+    return App.Rotation(mat)
+
+
+def _boite_centree(dim_u, dim_v, dim_f, centre_monde, rotation):
+    """Boîte rectangulaire centrée sur `centre_monde`, axes locaux alignés
+    par `rotation`.
+
+    Le placement est calculé à partir du CENTRE de la boîte : insensible au
+    sens (direct/indirect) de la base, et sans décalage de coordonnées
+    locales. Les centres sont calculés par l'appelant dans le repère (u, v,
+    axe) réel de la pièce.
+    """
+    if min(dim_u, dim_v, dim_f) <= 0.0:
+        raise ErreurDecoupe("Dimension d'outil nulle ou négative (paramètre de joint incohérent).")
+    boite = Part.makeBox(dim_u, dim_v, dim_f)
+    base = centre_monde - rotation.multVec(App.Vector(dim_u / 2.0, dim_v / 2.0, dim_f / 2.0))
+    boite.Placement = App.Placement(base, rotation)
+    return boite
+
+
+def _normaliser_prefixe(texte):
+    if texte is None:
+        return "Piece"
+    propre = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in texte.strip())
+    return propre or "Piece"
+
+
+def _valider_forme(obj):
+    """Vérifie que l'objet est un solide (ou un ensemble de solides fermés)."""
+    if obj is None:
+        raise ErreurDecoupe("Aucun objet à découper.")
+    if not hasattr(obj, "Shape") or obj.Shape is None or obj.Shape.isNull():
+        raise ErreurDecoupe("L'objet « " + obj.Name + " » ne possède pas de forme 3D exploitable.")
+    forme = obj.Shape
+    if not forme.isValid():
+        raise ErreurDecoupe("La forme de « " + obj.Name + " » est invalide (BRep corrompu). "
+                            "Essayez Part > Créer une copie simple ou Réparer la forme.")
+    solides = forme.Solids
+    if not solides:
+        raise ErreurDecoupe("La forme ne contient aucun solide fermé (coque ou surface ouverte ?) : "
+                            "les opérations booléennes de découpe exigent un solide.")
+    for sol in solides:
+        if not sol.isClosed():
+            raise ErreurDecoupe("La forme contient un solide non fermé : joint impossible.")
+    if forme.BoundBox.DiagonalLength <= 1e-9:
+        raise ErreurDecoupe("Emprise de la forme nulle.")
+    # Nettoyage : si la forme contient de la géométrie NON SOLIDE (faces ou
+    # arêtes libres, souvent laissées par une modélisation surfacique ou un
+    # loft/thickness), on ne garde que les solides : les booléennes OCC
+    # échouent ou donnent des résultats incohérents sinon.    if len(forme.Faces) != sum(len(s.Faces) for s in solides):
+        _warn("La forme contient de la géométrie non solide (faces libres) : "
+              "elle sera ignorée pour la découpe.")
+        forme = Part.makeCompound(solides) if len(solides) > 1 else solides[0]
+    if len(solides) > 1:
+        _warn("La forme contient " + str(len(solides)) + " solides : le joint sera appliqué à "
+              "l'ensemble (chaque île traversée par le plan recevra son tenon/bande).")
+    return forme
+
+
+def _recentrer_origine(forme, origine, n):
+    """Glisse l'origine DANS le plan pour qu'elle soit sous le centre de la
+    pièce : le plan de coupe est inchangé, mais les outils latéraux couvrent
+    toujours toute la pièce même si l'origine saisie est excentrée."""
+    centre = App.Vector(forme.BoundBox.Center)
+    ecart = (centre - origine).dot(n)
+    return centre - n * ecart
+
+
+def _afficher_plan_debug(prefixe, origine, n, diag):
+    """Crée un repère visuel du plan de coupe (quadrilatère orange transparent).
+
+    Utilisé quand le plan semble ne pas couper la pièce : l'utilisateur voit
+    alors dans la vue 3D où la macro place réellement son plan (origine +
+    normale), ce qui rend les erreurs de position immédiatement visibles."""
+    try:
+        doc = App.ActiveDocument
+        if doc is None:
+            return
+        axes_globaux = [App.Vector(1, 0, 0), App.Vector(0, 1, 0), App.Vector(0, 0, 1)]
+        u0 = min(axes_globaux, key=lambda a: abs(a.dot(n)))
+        u0 = (u0 - n * u0.dot(n)).normalize()
+        v0 = n.cross(u0)
+        rot = _rotation_axes(u0, v0, n)
+        cote = max(5.0, diag * 0.5)
+        face = Part.makePlane(cote, cote)
+        base = origine - rot.multVec(App.Vector(cote / 2.0, cote / 2.0, 0.0))
+        face.Placement = App.Placement(base, rot)
+        obj = doc.addObject("Part::Feature", (prefixe or "Piece") + "_Plan_Debug")
+        obj.Label = "Plan de coupe (repère de diagnostic, à supprimer)"
+        obj.Shape = face
+        doc.recompute()
+        if _ihm_disponible():
+            try:
+                obj.ViewObject.ShapeColor = (1.00, 0.60, 0.00)
+                obj.ViewObject.Transparency = 70
+            except Exception:
+                pass
+        _log("Repère de diagnostic du plan créé : " + obj.Name)
+    except Exception:
+        pass  # le repère est facultatif
+
+
+def _points_section(cs):
+    """Échantillonne les arêtes de la section pour mesurer son étendue réelle
+    dans le plan (les seuls sommets ne suffisent pas : une section circulaire
+    n'a que 1 ou 2 sommets)."""
+    pts = []
+    for arete in cs.Edges:
+        try:
+            pts.extend(arete.discretize(32))
+        except Exception:
+            pass
+    if not pts:
+        pts = [v.Point for v in cs.Vertexes]
+    return pts
+
+
+def _choisir_u_auto(pts, n):
+    """Choisit la direction u (dans le plan, parmi les axes globaux
+    projetés) qui maximise l'étendue de la section : les doigts seront
+    répartis sur la plus grande dimension. Les axes principaux donnent des
+    doigts alignés et prévisibles ; une direction particulière reste
+    saisissable manuellement."""
+    candidats = [App.Vector(1, 0, 0), App.Vector(0, 1, 0), App.Vector(0, 0, 1)]
+    meilleur = None
+    ext_max = -1.0
+    for cand in candidats:
+        cu = cand - n * cand.dot(n)
+        if cu.Length < 1e-9:
+            continue
+        cu.normalize()
+        vals = [p.dot(cu) for p in pts]
+        ext = max(vals) - min(vals)
+        if ext > ext_max:
+            ext_max = ext
+            meilleur = cu
+    return meilleur
+
+
+# ---------------------------------------------------------------------------
+#  Calcul des deux pièces
+# ---------------------------------------------------------------------------
+
+def calculer_pieces(forme, p):
+    """Retourne (piece_male, piece_femelle, liste_avertissements)."""
+    avert = []
+
+    # --- 1. Normalisation du plan -----------------------------------------
+    n = App.Vector(p["normale"])
+    if n.Length < 1e-9:
+        raise ErreurDecoupe("Le vecteur normal du plan de coupe est nul.")
+    n.normalize()
+
+    d = float(p["profondeur"])
+    c = float(p["jeu"])
+    if d <= 0.0:
+        raise ErreurDecoupe("La profondeur d'emboîtement doit être strictement positive.")
+    if c < 0.0:
+        raise ErreurDecoupe("Le jeu d'impression ne peut pas être négatif.")
+    if c >= 0.5 * d:
+        raise ErreurDecoupe("Le jeu (" + str(c) + " mm) est trop grand devant la profondeur ("
+                            + str(d) + " mm) : le tenon serait plus fin que le jeu.")
+
+    diag = forme.BoundBox.DiagonalLength
+    bb = forme.BoundBox
+    centre_piece = App.Vector(bb.Center)
+
+    # --- Diagnostic : le plan traverse-t-il au moins l'emprise de la pièce ?
+    # Position du plan le long de la normale, mesurée depuis le centre de la
+    # pièce. Si elle est hors de l'intervalle occupé par la pièce, le plan ne
+    # coupe JAMAIS la matière (cause la plus fréquente d'échec : l'origine du
+    # plan est déplacée, même si le plan "semble" bien placé à l'écran).
+    niveau_plan = (App.Vector(p["origine"]) - centre_piece).dot(n)
+    niveaux = []
+    for cx in (bb.XMin, bb.XMax):
+        for cy in (bb.YMin, bb.YMax):
+            for cz in (bb.ZMin, bb.ZMax):
+                niveaux.append((App.Vector(cx, cy, cz) - centre_piece).dot(n))
+    tol_plan = max(0.01, diag * 1e-6)
+    if niveau_plan > max(niveaux) + tol_plan or niveau_plan < min(niveaux) - tol_plan:
+        _afficher_plan_debug(p["prefixe"], App.Vector(p["origine"]), n, diag)
+        raise ErreurDecoupe(
+            "Le plan ne coupe pas la pièce : il est placé à "
+            + str(round(niveau_plan, 1)) + " mm du centre de la pièce le long de sa "
+            "normale, alors que la pièce s'étend de " + str(round(min(niveaux), 1))
+            + " à " + str(round(max(niveaux), 1)) + " mm autour de ce centre. "
+            "Déplacez l'origine du plan (ou le plan lui-même) dans cet intervalle. "
+            "Un repère orange « Plan de coupe (repère de diagnostic) » a été créé "
+            "dans la vue 3D pour visualiser où se trouve réellement votre plan.")
+
+    origine = _recentrer_origine(forme, App.Vector(p["origine"]), n)
+
+    # Dalle de référence pour la mesure de section (fine, centrée sur le plan)
+    eps = min(0.5, max(0.02, diag * 1e-4))
+
+    # --- 2. Base orthonormée : u (direction du joint), v, n -----------------
+    axes_globaux = [App.Vector(1, 0, 0), App.Vector(0, 1, 0), App.Vector(0, 0, 1)]
+    u0 = min(axes_globaux, key=lambda a: abs(a.dot(n)))
+    u0 = (u0 - n * u0.dot(n)).normalize()
+
+    # Section au plan : la dalle fine peut échouer sur des formes complexes
+    # (lofts, coques) : on réessaie avec une dalle progressivement plus
+    # épaisse avant de conclure que le plan ne coupe pas.
+    big0 = diag * 2.0 + 50.0
+    section = None
+    eps_essai = eps
+    for _ in range(3):
+        rot_n0 = _rotation_axes(u0, n.cross(u0), n)
+        dalle0 = _boite_centree(big0, big0, 2.0 * eps_essai, origine, rot_n0)
+        section = _op(lambda: forme.common(dalle0),
+                      "Calcul de la section au plan de coupe échoué")
+        if section.Volume > 1e-6:
+            break
+        eps_essai = eps_essai * 10.0
+    if section is None or section.Volume <= 1e-6:
+        _afficher_plan_debug(p["prefixe"], origine, n, diag)
+        raise ErreurDecoupe(
+            "Le plan ne coupe pas la pièce (section vide au plan), alors qu'il "
+            "traverse son emprise. Causes possibles : plan tangent à la surface "
+            "(déplacez-le légèrement), géométrie parasite dans la pièce, ou "
+            "origine du plan décalée. Un repère orange « Plan de coupe (repère "
+            "de diagnostic) » a été créé dans la vue 3D : s'il ne passe pas au "
+            "milieu de votre fuselage, l'origine du plan est en cause.")
+
+    pts = _points_section(section)
+
+    if p["dir_auto"]:
+        u = _choisir_u_auto(pts, n)
+        if u is None:
+            raise ErreurDecoupe("Impossible de déterminer une direction de joint automatique.")
+    else:
+        u = App.Vector(p["direction"]) - n * App.Vector(p["direction"]).dot(n)
+        if u.Length < 1e-9:
+            raise ErreurDecoupe("La direction du joint est parallèle à la normale du plan : "
+                                "choisissez une direction contenue dans le plan.")
+        u.normalize()
+    v = n.cross(u)
+    u = v.cross(n)  # ré-orthogonalisation exacte
+
+    # --- 3. Côtés mâle / femelle -------------------------------------------
+    # m : direction (unitaire) pointant vers la pièce MÂLE
+    # f : direction opposée = côté FEMELLE ; la bande de joint s'étend de
+    #     f=0 (plan) à f=d (profondeur) dans la partie femelle.
+    if p["cote_male"] == "B":
+        m = App.Vector(n).negative()
+    else:
+        m = App.Vector(n)
+    f = m.negative()
+
+    # Bases directes : v_axis = axe x u garantit u x v_axis = axe pour
+    # CHAQUE axe (m et f sont opposés : une seule base partagée serait
+    # indirecte pour l'un des deux).
+    v_f = f.cross(u)
+    v_m = m.cross(u)
+    rot_f = _rotation_axes(u, v_f, f)
+    rot_m = _rotation_axes(u, v_m, m)
+
+    big = diag * 1.5 + 10.0 * (d + c) + 50.0
+
+    def dalle(f0, f1, rot, axe):
+        centre = origine + axe * (0.5 * (f0 + f1))
+        return _boite_centree(big, big, f1 - f0, centre, rot)
+
+    # --- 4. Étendue de la section dans le plan (uMin..uMax, vMin..vMax) ----
+    # Coordonnées RELATIVES à l'origine du plan (re-centrée) : les centres
+    # des outils sont ensuite calculés comme origine + u*cu + v*cv.
+    us = [(pt - origine).dot(u) for pt in pts]
+    vs = [(pt - origine).dot(v) for pt in pts]
+    u_min, u_max = min(us), max(us)
+    v_min, v_max = min(vs), max(vs)
+    aire_section = section.Volume / (2.0 * eps)
+
+    # --- 5. Découpe brute en deux parties (vraies booléennes) ---------------
+    _log("Découpe brute du solide selon le plan...")
+    partie_m = _op(lambda: forme.cut(dalle(0.0, big, rot_f, f)),
+                   "Découpe de la partie mâle échouée")
+    partie_f = _op(lambda: forme.cut(dalle(0.0, big, rot_m, m)),
+                   "Découpe de la partie femelle échouée")
+
+    vol_min = max(1e-6, 1e-9 * forme.Volume)
+    if partie_m.Volume <= vol_min or partie_f.Volume <= vol_min:
+        raise ErreurDecoupe("Le plan ne traverse pas la pièce (un des deux côtés est vide). "
+                            "Le plan est peut-être tangent : déplacez-le.")
+
+    # --- 6. Bande de joint = matière réelle entre le plan et la profondeur --
+    _log("Calcul de la bande de joint (profondeur " + str(d) + " mm)...")
+    bande = _op(lambda: forme.common(dalle(0.0, d, rot_f, f)),
+                "Calcul de la bande de joint échoué (profondeur trop grande ?)")
+    if bande.Volume <= vol_min:
+        raise ErreurDecoupe("La bande de joint est vide : la profondeur dépasse la matière "
+                            "disponible côté femelle. Réduisez la profondeur.")
+    if bande.Volume < 0.5 * aire_section * d:
+        avert.append("La matière dans la bande de joint est bien plus faible que la section au "
+                     "plan : la pièce rétrécit rapidement après le plan, vérifiez le résultat.")
+    if d > 0.5 * diag:
+        avert.append("Profondeur (" + str(d) + " mm) très grande devant la taille de la pièce ("
+                     + str(round(diag, 1)) + " mm) : vérifiez le résultat.")
+
+    bande_prof = forme.common(dalle(0.0, d + c, rot_f, f))
+    if bande_prof.Volume < 0.9 * aire_section * (d + c):
+        avert.append("Profondeur d'emboîtement probablement trop grande (jeu inclus) : le joint "
+                     "risque de percer la surface de la pièce. Réduisez la profondeur.")
+
+    # --- 7. Construction du joint -------------------------------------------
+    if p["type_joint"] == "bande":
+        # Emboîtement pleine bande : toute la bande passe côté mâle.
+        # On part d'une bande étendue de 2xjeu DANS la partie mâle puis on la
+        # décale de -jeu : le tenon plonge de (d - jeu), garde un raccord
+        # volumique de jeu avec la partie mâle (fusion robuste), et présente
+        # un jeu latéral ET de fond égal au jeu saisi. La mortaise est la
+        # bande elle-même : ses parois suivent la surface réelle de la pièce.
+        _log("Joint : emboîtement rectangulaire (bande pleine)...")
+        bande_ext = _op(lambda: forme.common(dalle(-2.0 * c, d, rot_f, f)),
+                        "Calcul de la bande étendue échoué")
+        tenon = bande_ext
+        if c > 1e-9:
+            offset = None
+            try:
+                offset = bande_ext.makeOffsetShape(-c, 1e-5)
+            except Exception as exc:
+                avert.append("Décalage (offset) du tenon impossible (" + str(exc) +
+                             ") : jeu latéral NON appliqué, ajustement serré.")
+                offset = None
+            if offset is not None:
+                if (offset.isValid() and offset.Volume > 0.0 and offset.Solids
+                        and offset.Volume < bande_ext.Volume * 0.999):
+                    tenon = offset
+                else:
+                    avert.append("Offset du tenon inexploitable (paroi plus fine que 2x jeu ?) : "
+                                 "jeu latéral NON appliqué, ajustement serré.")
+        piece_m = _op(lambda: partie_m.fuse(tenon),
+                      "Fusion du tenon (bande) avec la partie mâle échouée")
+        piece_f = _op(lambda: partie_f.cut(bande),
+                      "Évidement (mortaise pleine bande) de la partie femelle échoué")
+
+    else:
+        # Tenon(s) : prismes rectangulaires posés sur le plan, répartis le
+        # long de u (direction du joint), longueurs selon v. Chaque tenon est
+        # intersecté avec la pièce (bande étendue de 2xjeu vers le côté mâle
+        # pour garantir l'ancrage) : il ne peut JAMAIS dépasser la matière.
+        nb = 1 if p["type_joint"] == "tenon" else int(p["nb_tenons"])
+        _log("Joint : " + ("tenon unique" if nb == 1 else "box joint avec "
+             + str(nb) + " doigts alternés") + "...")
+        marge_u = max(c + 0.3, 0.05 * (u_max - u_min))
+        marge_v = max(c + 0.3, 0.05 * (v_max - v_min))
+        u_lo, u_hi = u_min + marge_u, u_max - marge_u
+        l_max = (v_max - v_min) - 2.0 * marge_v
+        if (u_hi - u_lo) <= 1e-6 or l_max <= 1e-6:
+            raise ErreurDecoupe("Section trop petite pour placer des tenons une fois les marges "
+                                "de sécurité retirées.")
+
+        longueur = float(p["long_tenon"])
+        if longueur <= 0.0:
+            longueur = l_max
+        elif longueur > l_max:
+            avert.append("Longueur de tenon réduite à " + str(round(l_max, 2)) +
+                         " mm (limite de la section).")
+            longueur = l_max
+        v_centre = 0.5 * (v_min + v_max)
+
+        if nb == 1:
+            pas = u_hi - u_lo
+            centres = [0.5 * (u_lo + u_hi)]
+            larg_auto = 0.5 * pas
+        else:
+            pas = (u_hi - u_lo) / nb
+            centres = [u_lo + (i + 0.5) * pas for i in range(nb)]
+            larg_auto = 0.5 * pas
+
+        largeur = float(p["larg_tenon"])
+        if largeur <= 0.0:
+            largeur = larg_auto
+        largeur = min(largeur, u_hi - u_lo)
+        if nb > 1 and largeur >= pas:
+            avert.append("Largeur de tenon supérieure ou égale au pas : les tenons sont jointifs "
+                         "(résultat proche d'un emboîtement pleine bande).")
+
+        piece_m = partie_m
+        piece_f = partie_f
+        crees = 0
+        for idx, uc in enumerate(centres):
+            # Tenon : prisme f ∈ [-2c ; d] (dépasse côté mâle => ancrage
+            # volumique dans la partie mâle après fusion).
+            centre_t = (origine + u * uc + v * v_centre
+                        + f * (0.5 * (d - 2.0 * c)))
+            prisme = _boite_centree(largeur, longueur, d + 2.0 * c, centre_t, rot_f)
+            tenon = _op(lambda: prisme.common(forme),
+                        "Intersection du tenon " + str(idx + 1) + " avec la pièce échouée")
+            if tenon.Volume <= vol_min:
+                avert.append("Tenon " + str(idx + 1) + " entièrement hors matière : ignoré "
+                             "(changez la direction du joint, ses dimensions, ou le plan).")
+                continue
+            vol_theo = largeur * longueur * (d + 2.0 * c)
+            if tenon.Volume < 0.5 * vol_theo:
+                avert.append("Doigt " + str(idx + 1) + " partiellement hors matière ("
+                             + str(int(100.0 * tenon.Volume / vol_theo))
+                             + " %) : il a été automatiquement limité à la surface réelle de "
+                             "la pièce (comportement normal sur une section courbe ou évidée). "
+                             "S'il est trop petit, réduisez ses dimensions ou la profondeur.")
+            # Mortaise : prisme dilaté du jeu latéral (2xc) et du jeu de fond
+            # (d + c au lieu de d).
+            centre_o = (origine + u * uc + v * v_centre
+                        + f * (0.5 * (d + c)))
+            outil = _boite_centree(largeur + 2.0 * c, longueur + 2.0 * c, d + c,
+                                   centre_o, rot_f)
+            piece_m = _op(lambda: piece_m.fuse(tenon),
+                          "Fusion du tenon " + str(idx + 1) + " avec la partie mâle échouée")
+            piece_f = _op(lambda: piece_f.cut(outil),
+                          "Mortaise du tenon " + str(idx + 1) + " échouée")
+            crees += 1
+        if crees == 0:
+            raise ErreurDecoupe("Aucun doigt n'a pu être placé dans la matière : ajustez la "
+                                "direction du joint, les dimensions des doigts ou le plan.")
+        _log(str(crees) + " doigt(s) créé(s) et mortaisés (jeu " + str(c) + " mm).")
+
+    # --- 8. Contrôles finaux -------------------------------------------------
+    # Mortaise trop profonde sur paroi mince (fuselage évidé) : la partie
+    # femelle peut être SECTIONNÉE en plusieurs morceaux non connectés.
+    n_f_brut = len(partie_f.Solids)
+    n_f_final = len(piece_f.Solids)
+    if n_f_final > n_f_brut:
+        avert.append("La mortaise a sectionné une paroi : la partie femelle passe de "
+                     + str(n_f_brut) + " à " + str(n_f_final) + " morceaux non connectés. "
+                     "Réduisez la profondeur ou le jeu, ou déplacez le plan de coupe.")
+    n_m_brut = len(partie_m.Solids)
+    n_m_final = len(piece_m.Solids)
+    if n_m_final > n_m_brut:
+        avert.append("La partie mâle comporte " + str(n_m_final - n_m_brut)
+                     + " morceau(x) supplémentaire(s) après ajout du joint : vérifiez "
+                     "que chaque doigt est bien raccordé à la pièce.")
+
+    for nom, piece in (("mâle", piece_m), ("femelle", piece_f)):
+        if not piece.isValid():
+            raise ErreurDecoupe("La partie " + nom + " obtenue est invalide : opération "
+                                "booléenne instable sur cette forme. Essayez un plan "
+                                "légèrement décalé ou réduisez le jeu/profondeur.")
+        if piece.Volume <= vol_min or not piece.Solids:
+            raise ErreurDecoupe("La partie " + nom + " est vide : joint impossible avec ces "
+                                "paramètres.")
+        _log("Partie " + nom + " : " + str(round(piece.Volume, 1)) + " mm3, "
+             + str(len(piece.Solids)) + " solide(s), valide.")
+
+    commun = _op(lambda: piece_m.common(piece_f),
+                 "Vérification du chevauchement entre les deux parties échouée")
+    seuil = max(1e-3, 1e-6 * min(piece_m.Volume, piece_f.Volume))
+    if commun.Volume > seuil:
+        avert.append("Chevauchement volumique détecté entre les deux parties ("
+                     + str(round(commun.Volume, 4)) + " mm3) : contrôle manuel recommandé.")
+
+    try:
+        piece_m = piece_m.removeSplitter()
+        piece_f = piece_f.removeSplitter()
+    except Exception:
+        pass  # nettoyage facultatif
+
+    return piece_m, piece_f, avert
+
+
+# ---------------------------------------------------------------------------
+#  Création des objets dans le document
+# ---------------------------------------------------------------------------
+
+def creer_pieces_doc(doc, prefixe, piece_m, piece_f, original, inverser):
+    """Ajoute les deux pièces comme objets distincts, ne touche pas à
+    l'original (sauf masquage visuel)."""
+    if inverser:
+        piece_m, piece_f = piece_f, piece_m
+
+    obj_a = doc.addObject("Part::Feature", prefixe + "_Partie_A")
+    obj_a.Label = prefixe + " Partie A"
+    obj_a.Shape = piece_m
+
+    obj_b = doc.addObject("Part::Feature", prefixe + "_Partie_B")
+    obj_b.Label = prefixe + " Partie B"
+    obj_b.Shape = piece_f
+
+    doc.recompute()
+
+    for obj in (obj_a, obj_b):
+        if obj.Shape.isNull() or not obj.Shape.isValid():
+            raise ErreurDecoupe("L'objet " + obj.Label + " est devenu invalide après recompute.")
+
+    if _ihm_disponible() and original is not None and original.ViewObject is not None:
+        try:
+            original.ViewObject.Visibility = False
+        except Exception:
+            pass
+        for obj, coul in ((obj_a, (1.00, 0.45, 0.10)), (obj_b, (0.20, 0.50, 1.00))):
+            try:
+                obj.ViewObject.ShapeColor = coul
+            except Exception:
+                pass
+        try:
+            Gui.SendMsgToActiveView("ViewFit")
+        except Exception:
+            pass
+
+    _log("Objets créés : " + obj_a.Label + " et " + obj_b.Label +
+         " (original conservé, masqué).")
+    return obj_a, obj_b
+
+
+# ---------------------------------------------------------------------------
+#  Exécution
+# ---------------------------------------------------------------------------
+
+def executer(params):
+    """Chaîne complète : validation, calcul, création des objets."""
+    doc = App.ActiveDocument
+    if doc is None:
+        raise ErreurDecoupe("Aucun document actif : ouvrez ou créez un document.")
+
+    obj = doc.getObject(params["objet"]) if params.get("objet") else None
+    if obj is None:
+        raise ErreurDecoupe("Objet à découper introuvable dans le document actif.")
+
+    _log("=== Découpe avec joint de « " + obj.Name + " » ===")
+    forme = _valider_forme(obj)
+    piece_m, piece_f, avert = calculer_pieces(forme, params)
+    obj_a, obj_b = creer_pieces_doc(doc, _normaliser_prefixe(params["prefixe"]),
+                                    piece_m, piece_f, obj, bool(params["inverser"]))
+
+    resume = ("Découpe réussie.\n\n"
+              + obj_a.Label + " : " + str(round(obj_a.Shape.Volume, 1)) + " mm3\n"
+              + obj_b.Label + " : " + str(round(obj_b.Shape.Volume, 1)) + " mm3\n\n"
+              + "L'original a été conservé (masqué).")
+    if avert:
+        _warn(str(len(avert)) + " avertissement(s) :")
+        for a in avert:
+            _warn(" - " + a)
+        resume += "\n\n" + str(len(avert)) + " avertissement(s) — voir la console Rapports."
+    if _ihm_disponible():
+        QtWidgets.QMessageBox.information(None, "Découpe avec joint", resume)
+    else:
+        _log(resume.replace("\n", " | "))
+    return obj_a, obj_b
+
+
+# ---------------------------------------------------------------------------
+#  Interface graphique
+# ---------------------------------------------------------------------------
+
+class DialogueDecoupe(QtWidgets.QDialog):
+    """Boîte de dialogue de paramétrage."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent or (Gui.getMainWindow() if _ihm_disponible() else None))
+        self.setWindowTitle("Découpe d'une pièce avec joint d'assemblage")
+        self.setMinimumWidth(460)
+        self.params = None
+
+        racine = QtWidgets.QVBoxLayout(self)
+
+        # --- Objet à découper ------------------------------------------------
+        racine.addWidget(QtWidgets.QLabel("<b>Objet à découper</b>"))
+        self.cb_objet = QtWidgets.QComboBox()
+        self._remplir_objets()
+        racine.addWidget(self.cb_objet)
+
+        # --- Plan de coupe ----------------------------------------------------
+        racine.addWidget(QtWidgets.QLabel("<b>Plan de coupe</b>"))
+        self.btn_plan = QtWidgets.QPushButton(
+            "Importer depuis la sélection (face plane, plan, esquisse ou solide)")
+        self.btn_plan.clicked.connect(self._importer_plan)
+        racine.addWidget(self.btn_plan)
+        self.lbl_plan = QtWidgets.QLabel("Saisie manuelle : origine et normale ci-dessous.")
+        self.lbl_plan.setWordWrap(True)
+        racine.addWidget(self.lbl_plan)
+
+        grille = QtWidgets.QGridLayout()
+        grille.addWidget(QtWidgets.QLabel("Origine X / Y / Z"), 0, 0)
+        self.sp_ox = self._spin(grille, 0, 1)
+        self.sp_oy = self._spin(grille, 0, 2)
+        self.sp_oz = self._spin(grille, 0, 3)
+        grille.addWidget(QtWidgets.QLabel("Normale X / Y / Z"), 1, 0)
+        self.sp_nx = self._spin(grille, 1, 1)
+        self.sp_ny = self._spin(grille, 1, 2)
+        self.sp_nz = self._spin(grille, 1, 3)
+        self.sp_nz.setValue(1.0)
+        racine.addLayout(grille)
+
+        # --- Type de joint -----------------------------------------------------
+        racine.addWidget(QtWidgets.QLabel("<b>Type de joint</b>"))
+        self.cb_type = QtWidgets.QComboBox()
+        self.cb_type.addItems(["Box joint — doigts alternés (recommandé)",
+                               "Tenon et mortaise (tenon unique)",
+                               "Emboîtement rectangulaire (bande pleine)"])
+        self.cb_type.setCurrentIndex(0)
+        self.cb_type.currentIndexChanged.connect(self._maj_activation)
+        racine.addWidget(self.cb_type)
+
+        # --- Direction du joint -------------------------------------------------
+        self.grp_dir = QtWidgets.QGroupBox("Direction du joint (répartition des tenons)")
+        fd = QtWidgets.QFormLayout(self.grp_dir)
+        self.chk_auto = QtWidgets.QCheckBox("Automatique (plus grande étendue de la section)")
+        self.chk_auto.setChecked(True)
+        self.chk_auto.toggled.connect(self._maj_activation)
+        fd.addRow(self.chk_auto)
+        ligne_dir = QtWidgets.QHBoxLayout()
+        self.sp_dx = self._spin_d()
+        self.sp_dy = self._spin_d()
+        self.sp_dz = self._spin_d()
+        for sp in (self.sp_dx, self.sp_dy, self.sp_dz):
+            ligne_dir.addWidget(sp)
+        fd.addRow("Direction X / Y / Z", ligne_dir)
+        racine.addWidget(self.grp_dir)
+
+        # --- Dimensions du joint -------------------------------------------------
+        racine.addWidget(QtWidgets.QLabel("<b>Dimensions du joint</b>"))
+        grille_d = QtWidgets.QGridLayout()
+        grille_d.addWidget(QtWidgets.QLabel("Profondeur d'emboîtement (mm)"), 0, 0)
+        self.sp_prof = self._spin_mm()
+        self.sp_prof.setValue(6.0)
+        grille_d.addWidget(self.sp_prof, 0, 1)
+        grille_d.addWidget(QtWidgets.QLabel("Jeu d'impression (mm)"), 1, 0)
+        self.sp_jeu = self._spin_mm()
+        self.sp_jeu.setValue(0.2)
+        self.sp_jeu.setSingleStep(0.05)
+        grille_d.addWidget(self.sp_jeu, 1, 1)
+        racine.addLayout(grille_d)
+
+        # --- Doigts (box joint) ------------------------------------------------
+        self.grp_tenons = QtWidgets.QGroupBox("Doigts du box joint")
+        ft = QtWidgets.QGridLayout(self.grp_tenons)
+        ft.addWidget(QtWidgets.QLabel("Nombre de doigts"), 0, 0)
+        self.sp_nb = QtWidgets.QSpinBox()
+        self.sp_nb.setRange(1, 20)
+        self.sp_nb.setValue(5)
+        ft.addWidget(self.sp_nb, 0, 1)
+        ft.addWidget(QtWidgets.QLabel("Largeur du doigt (mm, 0 = auto)"), 1, 0)
+        self.sp_larg = self._spin_mm()
+        self.sp_larg.setMaximum(10000.0)
+        ft.addWidget(self.sp_larg, 1, 1)
+        ft.addWidget(QtWidgets.QLabel("Longueur du tenon (mm, 0 = auto)"), 2, 0)
+        self.sp_long = self._spin_mm()
+        ft.addWidget(self.sp_long, 2, 1)
+        racine.addWidget(self.grp_tenons)
+
+        # --- Côtés et nommage -------------------------------------------------------
+        racine.addWidget(QtWidgets.QLabel("<b>Côtés et nommage</b>"))
+        ligne_cote = QtWidgets.QHBoxLayout()
+        ligne_cote.addWidget(QtWidgets.QLabel("Côté mâle :"))
+        self.cb_cote = QtWidgets.QComboBox()
+        self.cb_cote.addItem("A (sens de la normale)")
+        self.cb_cote.addItem("B (sens opposé à la normale)")
+        ligne_cote.addWidget(self.cb_cote)
+        self.chk_inverser = QtWidgets.QCheckBox("Inverser les côtés A/B dans le résultat")
+        ligne_cote.addWidget(self.chk_inverser)
+        racine.addLayout(ligne_cote)
+
+        ligne_nom = QtWidgets.QHBoxLayout()
+        ligne_nom.addWidget(QtWidgets.QLabel("Préfixe des objets créés :"))
+        self.ed_prefixe = QtWidgets.QLineEdit("Piece")
+        ligne_nom.addWidget(self.ed_prefixe)
+        racine.addLayout(ligne_nom)
+
+        # --- Note -------------------------------------------------------------------
+        note = QtWidgets.QLabel("Réglages par défaut à ajuster selon votre imprimante, le "
+                                "matériau et l'orientation d'impression : jeu typique FDM "
+                                "0.15–0.30 mm ; profondeur 4–10 mm ; la partie mâle est "
+                                "déterminée par le sens de la normale saisie.")
+        note.setWordWrap(True)
+        racine.addWidget(note)
+
+        # --- Boutons ------------------------------------------------------------------
+        ligne_btn = QtWidgets.QHBoxLayout()
+        self.btn_decouper = QtWidgets.QPushButton("Découper")
+        self.btn_decouper.setDefault(True)
+        self.btn_fermer = QtWidgets.QPushButton("Fermer")
+        self.btn_decouper.clicked.connect(self._valider_et_fermer)
+        self.btn_fermer.clicked.connect(self.reject)
+        ligne_btn.addWidget(self.btn_decouper)
+        ligne_btn.addWidget(self.btn_fermer)
+        racine.addLayout(ligne_btn)
+
+        self._maj_activation()
+
+    # ---------------------------------------------------------------- widgets
+    @staticmethod
+    def _spin(grille, ligne, col):
+        sp = QtWidgets.QDoubleSpinBox()
+        sp.setRange(-100000.0, 100000.0)
+        sp.setDecimals(3)
+        grille.addWidget(sp, ligne, col)
+        return sp
+
+    @staticmethod
+    def _spin_d():
+        sp = QtWidgets.QDoubleSpinBox()
+        sp.setRange(-1.0, 1.0)
+        sp.setDecimals(3)
+        sp.setSingleStep(0.1)
+        return sp
+
+    @staticmethod
+    def _spin_mm():
+        sp = QtWidgets.QDoubleSpinBox()
+        sp.setRange(0.0, 10000.0)
+        sp.setDecimals(2)
+        sp.setSingleStep(1.0)
+        return sp
+
+    def _remplir_objets(self):
+        self.cb_objet.clear()
+        doc = App.ActiveDocument
+        if doc is None:
+            return
+        selectionnes = set()
+        if _ihm_disponible():
+            try:
+                selectionnes = set(o.Name for o in Gui.Selection.getSelection())
+            except Exception:
+                pass
+        index_sel = -1
+        for obj in doc.Objects:
+            if (hasattr(obj, "Shape") and obj.Shape is not None
+                    and not obj.Shape.isNull() and obj.Shape.Solids):
+                self.cb_objet.addItem(obj.Label + " [" + obj.Name + "]", obj.Name)
+                if obj.Name in selectionnes:
+                    index_sel = self.cb_objet.count() - 1
+        if index_sel >= 0:
+            self.cb_objet.setCurrentIndex(index_sel)
+
+    # ---------------------------------------------------------------- actions
+    def _maj_activation(self):
+        type_idx = self.cb_type.currentIndex()
+        self.grp_tenons.setEnabled(type_idx <= 1)
+        self.sp_nb.setEnabled(type_idx == 0)
+        self.grp_dir.setEnabled(type_idx <= 1)
+        auto = self.chk_auto.isChecked()
+        for sp in (self.sp_dx, self.sp_dy, self.sp_dz):
+            sp.setEnabled(not auto)
+
+    def _importer_plan(self):
+        """Lit la sélection (vue 3D ou arbre) et en déduit le plan de coupe.
+
+        Accepte, dans cet ordre de priorité :
+          1. une face plane d'un solide (normale orientée vers l'extérieur) ;
+          2. une esquisse (son plan XY local) ;
+          3. tout objet "plan" : datum PartDesign::Plane, plan d'origine
+             App::Plane, plan primitive Part::Plane ;
+          4. une forme à face unique plane (plan primitive) ;
+          5. un solide : sélectionné comme pièce à découper.
+        """
+        if not _ihm_disponible():
+            return
+        try:
+            sel = Gui.Selection.getSelectionEx()
+        except Exception:
+            sel = Gui.Selection.getSelectionEx("")
+        if not sel:
+            QtWidgets.QMessageBox.warning(self, "Découpe avec joint",
+                                          "Rien n'est sélectionné dans la vue 3D ou l'arbre.")
+            return
+
+        nom_solide = None
+        for ex in sel:
+            obj_sel = getattr(ex, "Object", None)
+            if obj_sel is None:
+                continue
+            tid = getattr(obj_sel, "TypeId", "") or ""
+
+            # 1. Face plane sélectionnée dans la vue 3D
+            if getattr(ex, "SubElementNames", None):
+                sous = ex.SubElementNames[0]
+                if sous.startswith("Face"):
+                    try:
+                        idx = int(sous.replace("Face", ""))
+                        face = obj_sel.Shape.Faces[idx - 1]
+                        surf = face.Surface
+                        if surf.__class__.__name__ != "Plane":
+                            QtWidgets.QMessageBox.warning(
+                                self, "Découpe avec joint",
+                                "La face sélectionnée n'est pas plane.")
+                            continue
+                        centre = face.CenterOfMass
+                        try:
+                            pu, pv = surf.parameter(centre)
+                            normale = face.normalAt(pu, pv)
+                        except Exception:
+                            normale = App.Vector(surf.Axis)
+                        # Oriente la normale vers l'extérieur de la matière
+                        bb = obj_sel.Shape.BoundBox
+                        if (App.Vector(bb.Center) - centre).dot(normale) > 0.0:
+                            normale = normale.negative()
+                        self._appliquer_plan(centre, normale,
+                                             "Face " + sous + " de " + obj_sel.Name)
+                        self._selectionner_objet(obj_sel.Name)
+                        return
+                    except ErreurDecoupe as exc:
+                        QtWidgets.QMessageBox.critical(self, "Découpe avec joint", str(exc))
+                        return
+                    except Exception as exc:
+                        QtWidgets.QMessageBox.critical(
+                            self, "Découpe avec joint", "Import de la face impossible : "
+                            + str(exc))
+                        return
+
+            # 2. Esquisse : plan XY local
+            if tid == "Sketcher::SketchObject":
+                pl = obj_sel.Placement
+                self._appliquer_plan(pl.Base, pl.Rotation.multVec(App.Vector(0, 0, 1)),
+                                     "Esquisse " + obj_sel.Name)
+                return
+
+            # 3. Plan de repère / origine / plan primitive (Part::Plane, etc.)
+            if "Plane" in tid and hasattr(obj_sel, "Placement"):
+                pl = obj_sel.Placement
+                self._appliquer_plan(pl.Base, pl.Rotation.multVec(App.Vector(0, 0, 1)),
+                                     "Plan " + obj_sel.Name)
+                return
+
+            # 4/5. Formes : primitive à face plane unique, ou solide
+            if (hasattr(obj_sel, "Shape") and obj_sel.Shape is not None
+                    and not obj_sel.Shape.isNull()):
+                faces = obj_sel.Shape.Faces
+                if len(faces) == 1 and faces[0].Surface.__class__.__name__ == "Plane":
+                    face = faces[0]
+                    centre = face.CenterOfMass
+                    normale = App.Vector(face.Surface.Axis)
+                    bb = obj_sel.Shape.BoundBox
+                    if (App.Vector(bb.Center) - centre).dot(normale) > 0.0:
+                        normale = normale.negative()
+                    self._appliquer_plan(centre, normale, "Plan " + obj_sel.Name)
+                    return
+                if obj_sel.Shape.Solids:
+                    nom_solide = nom_solide or obj_sel.Name
+
+        if nom_solide:
+            self._selectionner_objet(nom_solide)
+            QtWidgets.QMessageBox.information(
+                self, "Découpe avec joint",
+                "Objet « " + nom_solide + " » sélectionné comme pièce à découper. "
+                "Le plan reste à définir (face plane, plan, esquisse ou saisie manuelle).")
+            return
+
+        QtWidgets.QMessageBox.warning(
+            self, "Découpe avec joint",
+            "Sélectionnez une face plane, un plan (datum, origine, primitive ou esquisse), "
+            "ou un solide.")
+
+    def _appliquer_plan(self, centre, normale, libelle):
+        self.sp_ox.setValue(centre.x)
+        self.sp_oy.setValue(centre.y)
+        self.sp_oz.setValue(centre.z)
+        self.sp_nx.setValue(normale.x)
+        self.sp_ny.setValue(normale.y)
+        self.sp_nz.setValue(normale.z)
+        self.lbl_plan.setText("Plan importé : " + libelle)
+
+    def _selectionner_objet(self, nom):
+        idx = self.cb_objet.findData(nom)
+        if idx >= 0:
+            self.cb_objet.setCurrentIndex(idx)
+
+    def get_params(self):
+        erreurs = []
+        nom_objet = self.cb_objet.currentData()
+        if not nom_objet:
+            erreurs.append("Choisissez l'objet à découper.")
+        origine = App.Vector(self.sp_ox.value(), self.sp_oy.value(), self.sp_oz.value())
+        normale = App.Vector(self.sp_nx.value(), self.sp_ny.value(), self.sp_nz.value())
+        if normale.Length < 1e-9:
+            erreurs.append("La normale du plan de coupe est nulle.")
+        d = self.sp_prof.value()
+        c = self.sp_jeu.value()
+        if d <= 0.0:
+            erreurs.append("La profondeur d'emboîtement doit être > 0.")
+        if c < 0.0:
+            erreurs.append("Le jeu d'impression doit être >= 0.")
+        if d > 0.0 and c >= 0.5 * d:
+            erreurs.append("Le jeu doit rester inférieur à la moitié de la profondeur.")
+        if erreurs:
+            raise ErreurDecoupe("\n".join(erreurs))
+
+        idx_type = self.cb_type.currentIndex()
+        type_joint = ("tenons", "tenon", "bande")[idx_type]
+        direction = App.Vector(self.sp_dx.value(), self.sp_dy.value(), self.sp_dz.value())
+        return {
+            "objet": nom_objet,
+            "origine": origine,
+            "normale": normale,
+            "type_joint": type_joint,
+            "dir_auto": self.chk_auto.isChecked(),
+            "direction": direction,
+            "profondeur": d,
+            "jeu": c,
+            "nb_tenons": self.sp_nb.value(),
+            "larg_tenon": self.sp_larg.value(),
+            "long_tenon": self.sp_long.value(),
+            "cote_male": "B" if self.cb_cote.currentIndex() == 1 else "A",
+            "inverser": self.chk_inverser.isChecked(),
+            "prefixe": self.ed_prefixe.text(),
+        }
+
+    def _valider_et_fermer(self):
+        try:
+            self.params = self.get_params()
+        except ErreurDecoupe as exc:
+            QtWidgets.QMessageBox.critical(self, "Paramètres invalides", str(exc))
+            return
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
+#  Point d'entrée
+# ---------------------------------------------------------------------------
+
+def main():
+    if not _ihm_disponible():
+        if PARAMS is None:
+            App.Console.PrintError(
+                "[DecoupeJoint] Cette macro a besoin de l'interface graphique de FreeCAD, "
+                "ou d'une surcharge PARAMS (voir l'en-tête du fichier).\n")
+            return
+        try:
+            executer(PARAMS)
+        except ErreurDecoupe as exc:
+            App.Console.PrintError("[DecoupeJoint] " + str(exc) + "\n")
+        return
+
+    dialogue = DialogueDecoupe()
+    dialogue.exec_()
+    if dialogue.params is None:
+        _log("Opération annulée par l'utilisateur.")
+        return
+    try:
+        executer(dialogue.params)
+    except ErreurDecoupe as exc:
+        QtWidgets.QMessageBox.critical(None, "Découpe avec joint", str(exc))
+        _warn(str(exc))
+    except Exception:
+        App.Console.PrintError(traceback.format_exc())
+        QtWidgets.QMessageBox.critical(
+            None, "Découpe avec joint",
+            "Erreur inattendue : consultez la console Rapports (Vue > Panneaux > "
+            "Console Rapports) pour le détail.")
+
+
+if __name__ == "__main__":
+    main()
