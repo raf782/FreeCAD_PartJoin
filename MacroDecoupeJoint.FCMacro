@@ -543,7 +543,9 @@ def calculer_pieces(forme, p):
         crees = 0
         for idx, uc in enumerate(centres):
             # Tenon : prisme f ∈ [-2c ; d] (dépasse côté mâle => ancrage
-            # volumique dans la partie mâle après fusion).
+            # volumique dans la partie mâle après fusion). Borné par le
+            # prisme de la section au plan : extrémité ≤ base, donc le doigt
+            # entre toujours dans la mortaise (règle d'assemblage).
             centre_t = (origine + u * uc + v * v_centre
                         + f * (0.5 * (d - 2.0 * c)))
             prisme = _boite_centree(largeur, longueur, d + 2.0 * c, centre_t, rot_f)
