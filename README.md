@@ -1,1 +1,1 @@
-# FreeCAD_PartJoin
+# FreeCAD_Split-join_Generator
